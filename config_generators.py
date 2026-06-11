@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 from registry import get_configs_dir, get_docker_configs_dir, get_certs_dir, get_current_profile
 
 
@@ -205,16 +206,43 @@ def preview_delete(project, profile=None):
 
 
 def test_nginx_config(config_path):
+    config_path = os.path.abspath(config_path)
+    if not os.path.exists(config_path):
+        return False, f"配置文件不存在: {config_path}", ""
+
+    wrapper_content = f"""events {{
+    worker_connections 1024;
+}}
+http {{
+    include {config_path.replace(os.sep, '/')};
+}}
+"""
+
     try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".conf", prefix="vhost_nginx_wrapper_",
+            delete=False, encoding="utf-8",
+        ) as tmp:
+            tmp.write(wrapper_content)
+            wrapper_path = tmp.name
+
         result = subprocess.run(
-            ["nginx", "-t", "-c", config_path],
+            ["nginx", "-t", "-c", wrapper_path],
             capture_output=True, text=True,
             shell=(sys.platform == "win32"),
         )
+
+        try:
+            os.unlink(wrapper_path)
+        except Exception:
+            pass
+
         if result.returncode == 0:
             return True, "nginx 配置校验通过", result.stdout
         else:
-            return False, f"nginx 配置校验失败", result.stderr or result.stdout
+            detail = result.stderr or result.stdout
+            return False, "nginx 配置校验失败", detail
+
     except FileNotFoundError:
         return False, "nginx 未安装或不在 PATH 中", ""
 

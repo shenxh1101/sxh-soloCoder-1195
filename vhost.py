@@ -81,20 +81,25 @@ def _print_dry_run_delete(project, profile):
     print(f"\n提示: 确认无误后，去掉 --dry-run 正式执行。")
 
 
-def _collect_files_for_domain(domain, profile):
+def _domain_from_project(project):
+    return f"{project}.test"
+
+
+def _collect_files_for_project(project, profile):
+    d = _domain_from_project(project)
     files = []
     configs_dir = registry.get_configs_dir(profile)
     for ext in [".conf", ".Caddyfile"]:
-        p = configs_dir / f"{domain}{ext}"
+        p = configs_dir / f"{d}{ext}"
         if p.exists():
             files.append(str(p))
     certs_dir = registry.get_certs_dir(profile)
-    cert_domain_dir = certs_dir / domain
+    cert_domain_dir = certs_dir / d
     if cert_domain_dir.exists():
         for f in cert_domain_dir.iterdir():
             files.append(str(f))
     docker_dir = registry.get_docker_configs_dir(profile)
-    dp = docker_dir / f"{domain}.docker-compose.yml"
+    dp = docker_dir / f"{d}.docker-compose.yml"
     if dp.exists():
         files.append(str(dp))
     return files
@@ -108,14 +113,13 @@ def _undo_add(operation):
         if domain:
             hosts_manager.remove_hosts_entry(domain)
 
-    for domain in operation.get("domains", []):
-        files = _collect_files_for_domain(domain, profile)
-        for f in files:
+    for project in operation.get("domains", []):
+        for f in _collect_files_for_project(project, profile):
             try:
                 Path(f).unlink()
             except Exception:
                 pass
-        registry.remove_domain(domain, profile=profile)
+        registry.remove_domain(project, profile=profile)
 
     registry.commit_pop_operation()
 
@@ -133,6 +137,30 @@ def _undo_delete(operation):
             profile=profile,
         )
 
+        d = _domain_from_project(project)
+        proxy_type = entry_data.get("proxy", "nginx")
+        https = entry_data.get("https", False)
+        docker = entry_data.get("docker", False)
+        port = entry_data["port"]
+
+        key_path = None
+        cert_path = None
+        if https:
+            key_path, cert_path = ssl_manager.generate_self_signed_cert(d, profile=profile)
+            if cert_path:
+                registry.update_domain(project, profile=profile, cert_path=cert_path)
+            else:
+                registry.update_domain(project, profile=profile, https=False)
+
+        config_path, docker_config_path = config_generators.generate_config(
+            project, port,
+            proxy=proxy_type, https=(https and key_path is not None),
+            key_path=key_path, cert_path=cert_path, docker=docker, profile=profile,
+        )
+        registry.update_domain(project, profile=profile, config_path=config_path)
+        if docker_config_path:
+            registry.update_domain(project, profile=profile, docker_config_path=docker_config_path)
+
     for entry_str in operation.get("hosts_entries", []):
         domain = entry_str.split()[-1] if entry_str else ""
         if domain:
@@ -149,14 +177,13 @@ def _undo_import(operation):
         if domain:
             hosts_manager.remove_hosts_entry(domain)
 
-    for domain in operation.get("domains", []):
-        files = _collect_files_for_domain(domain, profile)
-        for f in files:
+    for project in operation.get("domains", []):
+        for f in _collect_files_for_project(project, profile):
             try:
                 Path(f).unlink()
             except Exception:
                 pass
-        registry.remove_domain(domain, profile=profile)
+        registry.remove_domain(project, profile=profile)
 
     registry.commit_pop_operation()
 
@@ -733,10 +760,16 @@ def cmd_test(args):
         print(f"\n配置校验通过。重载命令:")
         print(f"  {reload_cmd}")
     else:
-        print(f"✗ 配置校验失败: {config_path}")
-        print(f"  原因: {msg}")
+        print(f"\n✗ 配置校验失败")
+        print(f"  配置文件: {config_path}")
+        print(f"  校验命令: ", end="")
+        if proxy_type == "caddy":
+            print(f"caddy validate --config {config_path}")
+        else:
+            print(f"nginx -t -c <临时 wrapper 配置> (include {config_path})")
+        print(f"  失败原因: {msg}")
         if detail:
-            print(f"  详情:")
+            print(f"  错误详情:")
             for line in detail.strip().split("\n"):
                 if line.strip():
                     print(f"    {line}")
@@ -769,6 +802,18 @@ def cmd_profile(args):
             sys.exit(1)
         print(f"分组 '{name}' 已删除。域名数据仍保留在 hosts 和配置文件中。")
         print(f"如需清理，请手动删除 ~/.vhost/configs/{name} 等目录。")
+
+    else:
+        print("用法: vhost profile {list|use|delete} [参数]\n")
+        print("子命令:")
+        print("  list          列出所有分组")
+        print("  use  <名称>   切换当前分组")
+        print("  delete <名称> 删除分组")
+        print("\n示例:")
+        print("  vhost profile list")
+        print("  vhost profile use work")
+        print("  vhost profile delete team-a")
+        sys.exit(0 if args.profile_command is None else 1)
 
 
 def main():
