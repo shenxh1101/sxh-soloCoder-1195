@@ -3,6 +3,11 @@ import argparse
 import csv
 import sys
 import os
+import json
+import zipfile
+import tempfile
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 import registry
@@ -105,6 +110,16 @@ def _collect_files_for_project(project, profile):
     return files
 
 
+def _cleanup_empty_cert_dir(project, profile):
+    certs_dir = registry.get_certs_dir(profile)
+    cert_domain_dir = certs_dir / _domain_from_project(project)
+    if cert_domain_dir.exists():
+        try:
+            cert_domain_dir.rmdir()
+        except OSError:
+            pass
+
+
 def _undo_add(operation):
     profile = operation["profile"]
     hosts_entries = operation.get("hosts_entries", [])
@@ -119,6 +134,7 @@ def _undo_add(operation):
                 Path(f).unlink()
             except Exception:
                 pass
+        _cleanup_empty_cert_dir(project, profile)
         registry.remove_domain(project, profile=profile)
 
     registry.commit_pop_operation()
@@ -136,6 +152,10 @@ def _undo_delete(operation):
             docker=entry_data.get("docker", False),
             profile=profile,
         )
+
+        original_created = entry_data.get("created_at", "")
+        if original_created:
+            registry.update_domain(project, profile=profile, created_at=original_created)
 
         d = _domain_from_project(project)
         proxy_type = entry_data.get("proxy", "nginx")
@@ -183,6 +203,7 @@ def _undo_import(operation):
                 Path(f).unlink()
             except Exception:
                 pass
+        _cleanup_empty_cert_dir(project, profile)
         registry.remove_domain(project, profile=profile)
 
     registry.commit_pop_operation()
@@ -582,6 +603,193 @@ def cmd_info(args):
         print(f"Hosts: ✗ 未配置")
 
 
+def cmd_export(args):
+    profile = _resolve_profile(args)
+    output_path = Path(args.output)
+
+    domains = registry.list_domains(profile=profile)
+    if not domains:
+        print(f"错误: 分组 '{profile}' 中没有域名可导出")
+        sys.exit(1)
+
+    if output_path.suffix.lower() != ".zip":
+        output_path = output_path.with_suffix(".zip")
+
+    configs_dir = registry.get_configs_dir(profile)
+    certs_dir = registry.get_certs_dir(profile)
+    docker_dir = registry.get_docker_configs_dir(profile)
+
+    manifest = {
+        "vhost_version": "2",
+        "profile": profile,
+        "exported_at": datetime.now().isoformat(),
+        "domains": registry.list_domains(profile=profile),
+    }
+
+    with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+
+        if configs_dir.exists():
+            for f in configs_dir.iterdir():
+                if f.is_file():
+                    zf.write(f, f"configs/{f.name}")
+
+        if certs_dir.exists():
+            for f in certs_dir.rglob("*"):
+                if f.is_file():
+                    zf.write(f, f"certs/{f.relative_to(certs_dir)}")
+
+        if docker_dir.exists():
+            for f in docker_dir.iterdir():
+                if f.is_file():
+                    zf.write(f, f"docker/{f.name}")
+
+    print(f"已导出分组 '{profile}' ({len(domains)} 个域名) 到: {output_path}")
+    print(f"\n备份包内容:")
+    print(f"  manifest.json  - 域名注册信息")
+    print(f"  configs/       - 代理配置文件 ({sum(1 for _ in configs_dir.glob('*') if _.is_file()) if configs_dir.exists() else 0} 个)")
+    print(f"  certs/         - SSL 证书文件")
+    print(f"  docker/        - Docker Compose 配置")
+    print(f"\n恢复命令: vhost import-backup {output_path} [--profile <目标分组>] [--dry-run]")
+
+
+def cmd_import_backup(args):
+    backup_path = Path(args.file)
+    if not backup_path.exists():
+        print(f"错误: 备份文件不存在: {backup_path}")
+        sys.exit(1)
+
+    target_profile = args.profile
+
+    with zipfile.ZipFile(str(backup_path), "r") as zf:
+        names = zf.namelist()
+        if "manifest.json" not in names:
+            print("错误: 无效的备份文件，缺少 manifest.json")
+            sys.exit(1)
+
+        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+        source_profile = manifest.get("profile", "unknown")
+        source_domains = manifest.get("domains", [])
+
+        if target_profile is None:
+            target_profile = source_profile
+        if target_profile == "default" and source_profile != "default":
+            target_profile = source_profile
+
+    if not source_domains:
+        print("错误: 备份文件中没有域名数据")
+        sys.exit(1)
+
+    existing = registry.list_domains(profile=target_profile)
+    existing_projects = {e["project"] for e in existing}
+
+    to_add = []
+    to_overwrite = []
+    to_skip = []
+
+    for entry in source_domains:
+        project = entry["project"]
+        if project in existing_projects:
+            to_overwrite.append(entry)
+        else:
+            to_add.append(entry)
+
+    print(f"\n备份文件: {backup_path}")
+    print(f"源分组: {source_profile}")
+    print(f"目标分组: {target_profile}")
+    print(f"\n预览:")
+    print(f"  新增: {len(to_add)}")
+    for e in to_add:
+        print(f"    + {e['project']}.test -> localhost:{e['port']} ({e.get('proxy', 'nginx')})")
+    print(f"  覆盖: {len(to_overwrite)}")
+    for e in to_overwrite:
+        print(f"    ~ {e['project']}.test -> localhost:{e['port']} ({e.get('proxy', 'nginx')})")
+    print(f"  跳过: {len(to_skip)}")
+
+    if args.dry_run:
+        print(f"\n提示: 确认无误后，去掉 --dry-run 正式执行。")
+        return
+
+    if not to_add and not to_overwrite:
+        print("\n没有需要导入的内容。")
+        return
+
+    if to_overwrite:
+        print(f"\n警告: 将覆盖 {len(to_overwrite)} 个已存在的域名。")
+    answer = input("\n确认导入? [y/N]: ").strip().lower()
+    if answer not in ("y", "yes"):
+        print("已取消。")
+        return
+
+    hosts_manager.require_admin()
+
+    success = 0
+    fail = 0
+
+    with zipfile.ZipFile(str(backup_path), "r") as zf:
+        for entry in to_add + to_overwrite:
+            project = entry["project"]
+            try:
+                if project in existing_projects:
+                    registry.remove_domain(project, profile=target_profile)
+
+                registry.add_domain(
+                    project, entry["port"],
+                    proxy=entry.get("proxy", "nginx"),
+                    https=entry.get("https", False),
+                    docker=entry.get("docker", False),
+                    profile=target_profile,
+                )
+
+                if entry.get("created_at"):
+                    registry.update_domain(project, profile=target_profile, created_at=entry["created_at"])
+
+                domain = _domain_from_project(project)
+                hosts_manager.add_hosts_entry(domain)
+
+                target_configs = registry.get_configs_dir(target_profile)
+                target_certs = registry.get_certs_dir(target_profile)
+                target_docker = registry.get_docker_configs_dir(target_profile)
+
+                config_prefix = f"configs/{domain}"
+                for name in zf.namelist():
+                    if name.startswith(config_prefix + "."):
+                        target_path = target_configs / Path(name).name
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(target_path, "wb") as f:
+                            f.write(zf.read(name))
+
+                cert_prefix = f"certs/{domain}"
+                for name in zf.namelist():
+                    if name.startswith(cert_prefix + "/") or name.startswith(cert_prefix + "\\"):
+                        rel = Path(name).relative_to("certs")
+                        target_path = target_certs / rel
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(target_path, "wb") as f:
+                            f.write(zf.read(name))
+
+                docker_name = f"docker/{domain}.docker-compose.yml"
+                if docker_name in zf.namelist():
+                    target_path = target_docker / f"{domain}.docker-compose.yml"
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(target_path, "wb") as f:
+                        f.write(zf.read(docker_name))
+
+                registry.update_domain(
+                    project, profile=target_profile,
+                    config_path=str(target_configs / f"{domain}.{'Caddyfile' if entry.get('proxy') == 'caddy' else 'conf'}"),
+                )
+
+                print(f"  ✓ {project}.test")
+                success += 1
+
+            except Exception as e:
+                print(f"  ✗ {project}: {e}")
+                fail += 1
+
+    print(f"\n导入完成: 成功 {success}, 失败 {fail}")
+
+
 def cmd_doctor(args):
     print("VHost 环境诊断")
     print("=" * 60)
@@ -803,16 +1011,37 @@ def cmd_profile(args):
         print(f"分组 '{name}' 已删除。域名数据仍保留在 hosts 和配置文件中。")
         print(f"如需清理，请手动删除 ~/.vhost/configs/{name} 等目录。")
 
+    elif args.profile_command == "rename":
+        ok, err = registry.rename_profile(args.old_name, args.new_name)
+        if not ok:
+            print(f"错误: {err}")
+            sys.exit(1)
+        print(f"分组 '{args.old_name}' 已重命名为 '{args.new_name}'")
+        print(f"配置目录、证书目录、Docker 配置目录已同步迁移。")
+
+    elif args.profile_command == "copy":
+        ok, err = registry.copy_profile(args.src_name, args.dst_name)
+        if not ok:
+            print(f"错误: {err}")
+            sys.exit(1)
+        src_count = len(registry.list_domains(profile=args.src_name))
+        dst_count = len(registry.list_domains(profile=args.dst_name))
+        print(f"分组 '{args.src_name}' ({src_count} 个域名) 已复制为 '{args.dst_name}' ({dst_count} 个域名)")
+        print(f"配置目录、证书目录、Docker 配置目录已同步复制。")
+
     else:
-        print("用法: vhost profile {list|use|delete} [参数]\n")
+        print("用法: vhost profile {list|use|delete|rename|copy} [参数]\n")
         print("子命令:")
-        print("  list          列出所有分组")
-        print("  use  <名称>   切换当前分组")
-        print("  delete <名称> 删除分组")
+        print("  list                  列出所有分组")
+        print("  use  <名称>           切换当前分组")
+        print("  delete <名称>         删除分组")
+        print("  rename <旧名> <新名>  重命名分组")
+        print("  copy  <源> <目标>     复制分组")
         print("\n示例:")
         print("  vhost profile list")
         print("  vhost profile use work")
-        print("  vhost profile delete team-a")
+        print("  vhost profile rename team-a team-b")
+        print("  vhost profile copy work work-2025")
         sys.exit(0 if args.profile_command is None else 1)
 
 
@@ -833,14 +1062,19 @@ def main():
   vhost delete myblog                       删除虚拟域名
   vhost import projects.csv                 批量导入
   vhost import projects.csv --dry-run       预览批量导入
+  vhost export backup.zip                   导出当前分组备份
+  vhost export backup.zip --profile work    导出 work 分组
+  vhost import-backup backup.zip            恢复备份
+  vhost import-backup backup.zip --dry-run  预览备份恢复
   vhost test myblog                         校验代理配置
-  vhost test myblog --profile work          校验 work 分组配置
   vhost history                             查看操作记录
   vhost undo                                撤销最近一次操作
   vhost backup                              手动备份 hosts
   vhost doctor                              环境诊断
   vhost profile list                        列出所有分组
   vhost profile use work                    切换到 work 分组
+  vhost profile rename team-a team-b        重命名分组
+  vhost profile copy work work-2025         复制分组
         """,
     )
 
@@ -881,6 +1115,17 @@ def main():
     parser_backup = subparsers.add_parser("backup", help="手动备份 hosts 文件")
     parser_backup.set_defaults(func=cmd_backup)
 
+    parser_export = subparsers.add_parser("export", help="导出分组备份包")
+    parser_export.add_argument("output", help="输出文件路径 (.zip)")
+    add_profile_arg(parser_export)
+    parser_export.set_defaults(func=cmd_export)
+
+    parser_import_backup = subparsers.add_parser("import-backup", help="从备份包恢复")
+    parser_import_backup.add_argument("file", help="备份文件路径 (.zip)")
+    parser_import_backup.add_argument("--profile", default=None, help="目标分组名称（默认使用备份中的分组名）")
+    add_dry_run_arg(parser_import_backup)
+    parser_import_backup.set_defaults(func=cmd_import_backup)
+
     parser_info = subparsers.add_parser("info", help="查看虚拟域名详情")
     parser_info.add_argument("project", help="项目名称")
     add_profile_arg(parser_info)
@@ -911,6 +1156,14 @@ def main():
     profile_delete = profile_subs.add_parser("delete", help="删除分组")
     profile_delete.add_argument("name", help="分组名称")
     profile_delete.set_defaults(func=cmd_profile)
+    profile_rename = profile_subs.add_parser("rename", help="重命名分组")
+    profile_rename.add_argument("old_name", help="旧分组名")
+    profile_rename.add_argument("new_name", help="新分组名")
+    profile_rename.set_defaults(func=cmd_profile)
+    profile_copy = profile_subs.add_parser("copy", help="复制分组")
+    profile_copy.add_argument("src_name", help="源分组名")
+    profile_copy.add_argument("dst_name", help="目标分组名")
+    profile_copy.set_defaults(func=cmd_profile)
     parser_profile.set_defaults(func=cmd_profile)
 
     args = parser.parse_args()

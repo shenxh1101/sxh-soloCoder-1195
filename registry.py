@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -86,6 +87,77 @@ def delete_profile(name):
     del registry["profiles"][name]
     save_registry(registry)
     return True, None
+
+
+def rename_profile(old_name, new_name):
+    if old_name == "default":
+        return False, "不能重命名 default 分组"
+    if new_name == old_name:
+        return False, "新旧名称相同"
+    if not _is_valid_profile_name(new_name):
+        return False, "分组名只能包含字母、数字、连字符和下划线，且必须以字母开头"
+
+    registry = load_registry()
+    if old_name not in registry.get("profiles", {}):
+        return False, f"分组 '{old_name}' 不存在"
+    if new_name in registry.get("profiles", {}):
+        return False, f"分组 '{new_name}' 已存在"
+
+    registry["profiles"][new_name] = registry["profiles"].pop(old_name)
+    for entry in registry["profiles"][new_name].get("domains", {}).values():
+        entry["profile"] = new_name
+
+    if registry["current_profile"] == old_name:
+        registry["current_profile"] = new_name
+
+    save_registry(registry)
+
+    vhost_dir = get_vhost_dir()
+    for sub in ["configs", "certs", "docker"]:
+        old_dir = vhost_dir / sub / old_name
+        new_dir = vhost_dir / sub / new_name
+        if old_dir.exists() and not new_dir.exists():
+            shutil.move(str(old_dir), str(new_dir))
+
+    return True, None
+
+
+def copy_profile(src_name, dst_name):
+    if not src_name or not dst_name:
+        return False, "源分组和目标分组名不能为空"
+    if not _is_valid_profile_name(dst_name):
+        return False, "目标分组名只能包含字母、数字、连字符和下划线，且必须以字母开头"
+
+    registry = load_registry()
+    if src_name not in registry.get("profiles", {}):
+        return False, f"分组 '{src_name}' 不存在"
+    if dst_name in registry.get("profiles", {}):
+        return False, f"分组 '{dst_name}' 已存在"
+
+    import copy
+    src_data = copy.deepcopy(registry["profiles"][src_name])
+    registry["profiles"][dst_name] = src_data
+    for entry in registry["profiles"][dst_name].get("domains", {}).values():
+        entry["profile"] = dst_name
+
+    save_registry(registry)
+
+    vhost_dir = get_vhost_dir()
+    for sub in ["configs", "certs", "docker"]:
+        src_dir = vhost_dir / sub / src_name
+        dst_dir = vhost_dir / sub / dst_name
+        if src_dir.exists() and not dst_dir.exists():
+            shutil.copytree(str(src_dir), str(dst_dir))
+
+    return True, None
+
+
+def _is_valid_profile_name(name):
+    if not name:
+        return False
+    if not name[0].isalpha():
+        return False
+    return all(c.isalnum() or c in ('-', '_') for c in name)
 
 
 def _ensure_profile(registry, profile_name):
