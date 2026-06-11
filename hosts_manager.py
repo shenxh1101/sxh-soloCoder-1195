@@ -2,24 +2,41 @@ import os
 import sys
 import shutil
 import tempfile
-import ctypes
 from datetime import datetime
 from pathlib import Path
 
 
 def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except Exception:
-        return os.geteuid() == 0
+    if sys.platform == "win32":
+        import ctypes
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin()
+        except Exception:
+            return False
+    return os.geteuid() == 0
 
 
 def require_admin():
-    if not is_admin():
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, " ".join(sys.argv), None, 1
-        )
-        sys.exit(0)
+    if is_admin():
+        return
+
+    if sys.platform == "win32":
+        import ctypes
+        try:
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, " ".join(sys.argv), None, 1
+            )
+            sys.exit(0)
+        except Exception:
+            print("错误: 无法提升权限，请以管理员身份运行此程序。")
+            sys.exit(1)
+    else:
+        print("此操作需要管理员权限。请使用以下命令重新运行:")
+        print(f"  sudo python {' '.join(sys.argv)}")
+        print("")
+        print("或者在当前终端中执行:")
+        print(f"  sudo -E env PATH=$PATH python {' '.join(sys.argv)}")
+        sys.exit(1)
 
 
 def get_hosts_path():

@@ -11,26 +11,106 @@ import config_generators
 import ssl_manager
 
 
-def cmd_add(args):
-    hosts_manager.require_admin()
+def validate_project_name(project):
+    if not project:
+        return "项目名为空"
+    if not project.isalnum():
+        return f"项目名只能包含字母和数字，收到: '{project}'"
+    if not project[0].isalpha():
+        return f"项目名必须以字母开头，收到: '{project}'"
+    return None
 
+
+def validate_port(port_str):
+    try:
+        port = int(port_str)
+        if port < 1 or port > 65535:
+            return f"端口号超出范围: {port_str}"
+        return None
+    except (ValueError, TypeError):
+        return f"端口号无效: '{port_str}'"
+
+
+def _validate_csv_row(row_num, project, port_str, https_val, docker_val, proxy_val, existing_projects):
+    errors = []
+
+    proj_err = validate_project_name(project)
+    if proj_err:
+        errors.append(proj_err)
+
+    port_err = validate_port(port_str)
+    if port_err:
+        errors.append(port_err)
+
+    if project and project in existing_projects:
+        errors.append(f"项目 '{project}' 已存在")
+
+    return errors
+
+
+def _print_dry_run_banner(command):
+    print("=" * 60)
+    print(f"  DRY-RUN 模式 - 预览 {command} 操作")
+    print("=" * 60)
+    print("以下是将要执行的操作，不会实际修改任何文件。\n")
+
+
+def _print_dry_run_add(project, port, proxy, https, docker):
+    preview = config_generators.preview_config(project, port, proxy=proxy, https=https, docker=docker)
+    domain = preview["domain"]
+
+    print(f"  [Hosts] 将添加: {preview['hosts_entry']}")
+    print(f"  [配置] 将生成: {preview['config_path']}")
+
+    if https:
+        print(f"  [SSL]  将生成证书: {preview.get('cert_path', 'N/A')}")
+        print(f"  [SSL]  将生成私钥: {preview.get('key_path', 'N/A')}")
+
+    if docker:
+        print(f"  [Docker] 将生成: {preview.get('docker_config_path', 'N/A')}")
+
+    print(f"\n提示: 确认无误后，去掉 --dry-run 正式执行。")
+
+
+def _print_dry_run_delete(project):
+    preview = config_generators.preview_delete(project)
+    domain = preview["domain"]
+
+    print(f"  [Hosts] 将移除: {preview['hosts_entry']}")
+
+    if preview["files_to_remove"]:
+        print(f"  [文件] 将删除以下文件:")
+        for f in preview["files_to_remove"]:
+            print(f"         - {f}")
+    else:
+        print(f"  [文件] 没有需要删除的文件")
+
+    print(f"\n提示: 确认无误后，去掉 --dry-run 正式执行。")
+
+
+def cmd_add(args):
     project = args.project
     port = args.port
 
-    if not project.isalnum():
-        print(f"错误: 项目名只能包含字母和数字，收到: '{project}'")
+    proj_err = validate_project_name(project)
+    if proj_err:
+        print(f"错误: {proj_err}")
         sys.exit(1)
 
-    try:
-        port = int(port)
-        if port < 1 or port > 65535:
-            raise ValueError
-    except ValueError:
-        print(f"错误: 端口号无效: '{args.port}'，必须是 1-65535 之间的整数")
+    port_err = validate_port(port)
+    if port_err:
+        print(f"错误: {port_err}")
         sys.exit(1)
+
+    if args.dry_run:
+        _print_dry_run_banner("add")
+        _print_dry_run_add(project, int(port), args.proxy, args.https, args.docker)
+        return
+
+    hosts_manager.require_admin()
 
     entry, err = registry.add_domain(
-        project, port,
+        project, int(port),
         proxy=args.proxy,
         https=args.https,
         docker=args.docker,
@@ -62,11 +142,12 @@ def cmd_add(args):
             entry["https"] = False
 
     config_path, docker_config_path = config_generators.generate_config(
-        project, port,
+        project, int(port),
         proxy=args.proxy,
         https=entry.get("https", False),
         key_path=key_path,
         cert_path=cert_path,
+        docker=args.docker,
     )
 
     registry.update_domain(project, config_path=config_path)
@@ -82,8 +163,9 @@ def cmd_add(args):
         print(f"  HTTPS 已启用")
         print(f"  证书路径: {cert_path}")
 
-    if args.docker:
+    if args.docker and docker_config_path:
         print(f"  Docker Compose Override: {docker_config_path}")
+        print(f"  使用方式: docker compose -f docker-compose.yml -f {docker_config_path} up")
 
     if args.proxy == "nginx":
         print(f"\n使用方法:")
@@ -127,6 +209,15 @@ def cmd_list(args):
 
 
 def cmd_delete(args):
+    if args.dry_run:
+        entry = registry.get_domain(args.project)
+        if not entry:
+            print(f"错误: 项目 '{args.project}' 不存在")
+            sys.exit(1)
+        _print_dry_run_banner("delete")
+        _print_dry_run_delete(args.project)
+        return
+
     hosts_manager.require_admin()
 
     project = args.project
@@ -152,54 +243,115 @@ def cmd_delete(args):
 
 
 def cmd_import(args):
-    hosts_manager.require_admin()
-
     csv_path = Path(args.file)
     if not csv_path.exists():
         print(f"错误: 文件不存在: {csv_path}")
         sys.exit(1)
 
-    with open(csv_path, "r", encoding="utf-8") as f:
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
 
         required_cols = {"project", "port"}
         if reader.fieldnames is None or not required_cols.issubset(set(reader.fieldnames)):
             print(f"错误: CSV 文件必须包含 'project' 和 'port' 列")
             print(f"  当前列: {reader.fieldnames}")
+            print(f"  CSV 格式示例: project,port,https,docker,proxy")
             sys.exit(1)
 
-        success_count = 0
-        skip_count = 0
-        error_count = 0
+        rows = list(reader)
 
-        for row_num, row in enumerate(reader, start=2):
-            project = row.get("project", "").strip()
-            port_str = row.get("port", "").strip()
+    existing_projects = {e["project"] for e in registry.list_domains()}
 
-            if not project or not port_str:
-                print(f"  行 {row_num}: 跳过空行")
-                skip_count += 1
-                continue
+    valid_rows = []
+    invalid_rows = []
 
-            try:
-                port = int(port_str)
-                if port < 1 or port > 65535:
-                    raise ValueError
-            except ValueError:
-                print(f"  行 {row_num} ({project}): 端口无效 '{port_str}'")
-                error_count += 1
-                continue
+    for row_num, row in enumerate(rows, start=2):
+        project = row.get("project", "").strip()
+        port_str = row.get("port", "").strip()
 
+        if not project and not port_str:
+            continue
+
+        errors = _validate_csv_row(
+            row_num, project, port_str,
+            row.get("https", ""), row.get("docker", ""), row.get("proxy", ""),
+            existing_projects,
+        )
+
+        if errors:
+            invalid_rows.append({
+                "row_num": row_num,
+                "project": project,
+                "errors": errors,
+            })
+        else:
             https = row.get("https", "").strip().lower() in ("yes", "true", "1")
             docker = row.get("docker", "").strip().lower() in ("yes", "true", "1")
             proxy = row.get("proxy", "").strip().lower()
             if proxy not in ("nginx", "caddy"):
                 proxy = "nginx"
 
-            entry, err = registry.add_domain(project, port, proxy=proxy, https=https, docker=docker)
+            valid_rows.append({
+                "row_num": row_num,
+                "project": project,
+                "port": int(port_str),
+                "https": https,
+                "docker": docker,
+                "proxy": proxy,
+            })
+            existing_projects.add(project)
+
+    if invalid_rows:
+        print(f"CSV 校验发现 {len(invalid_rows)} 个问题行:")
+        print("-" * 60)
+        for inv in invalid_rows:
+            print(f"  行 {inv['row_num']} ({inv['project'] or '空'}):")
+            for e in inv["errors"]:
+                print(f"    - {e}")
+        print("-" * 60)
+
+    if not valid_rows:
+        print("\n没有可导入的有效行。")
+        sys.exit(1)
+
+    if invalid_rows:
+        print(f"\n共 {len(valid_rows)} 行通过校验，{len(invalid_rows)} 行存在问题。")
+        answer = input("是否继续导入通过校验的行? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("已取消导入。")
+            sys.exit(0)
+
+    if args.dry_run:
+        _print_dry_run_banner("import")
+        print(f"将导入 {len(valid_rows)} 个域名:\n")
+        for row in valid_rows:
+            preview = config_generators.preview_config(
+                row["project"], row["port"],
+                proxy=row["proxy"], https=row["https"], docker=row["docker"],
+            )
+            print(f"  [{row['project']}] {preview['hosts_entry']}")
+            print(f"           配置: {preview['config_path']}")
+            if row["https"]:
+                print(f"           证书: {preview.get('cert_path', 'N/A')}")
+            if row["docker"]:
+                print(f"           Docker: {preview.get('docker_config_path', 'N/A')}")
+        print(f"\n提示: 确认无误后，去掉 --dry-run 正式执行。")
+        return
+
+    hosts_manager.require_admin()
+
+    success_rows = []
+    fail_rows = []
+
+    for row in valid_rows:
+        project = row["project"]
+        try:
+            entry, err = registry.add_domain(
+                project, row["port"],
+                proxy=row["proxy"], https=row["https"], docker=row["docker"],
+            )
             if err:
-                print(f"  行 {row_num} ({project}): {err}")
-                skip_count += 1
+                fail_rows.append({"project": project, "error": err})
                 continue
 
             domain = entry["domain"]
@@ -207,25 +359,43 @@ def cmd_import(args):
 
             key_path = None
             cert_path = None
-            if https:
+            if row["https"]:
                 key_path, cert_path = ssl_manager.generate_self_signed_cert(domain)
-                if key_path:
+                if key_path and cert_path:
                     registry.update_domain(project, cert_path=cert_path)
                 else:
                     registry.update_domain(project, https=False)
 
             config_path, docker_config_path = config_generators.generate_config(
-                project, port, proxy=proxy, https=entry.get("https", False),
-                key_path=key_path, cert_path=cert_path,
+                project, row["port"],
+                proxy=row["proxy"], https=entry.get("https", False),
+                key_path=key_path, cert_path=cert_path, docker=row["docker"],
             )
             registry.update_domain(project, config_path=config_path)
             if docker_config_path:
                 registry.update_domain(project, docker_config_path=docker_config_path)
 
-            print(f"  ✓ {project}.test -> localhost:{port}")
-            success_count += 1
+            success_rows.append(project)
+        except Exception as e:
+            fail_rows.append({"project": project, "error": str(e)})
 
-        print(f"\n批量导入完成: 成功 {success_count}, 跳过 {skip_count}, 错误 {error_count}")
+    print(f"\n{'='*60}")
+    print(f"批量导入完成")
+    print(f"{'='*60}")
+    print(f"  成功: {len(success_rows)}")
+    if success_rows:
+        for p in success_rows:
+            print(f"    ✓ {p}")
+
+    print(f"  失败: {len(fail_rows)}")
+    if fail_rows:
+        for f_row in fail_rows:
+            print(f"    ✗ {f_row['project']}: {f_row['error']}")
+
+    if invalid_rows:
+        print(f"  校验未通过: {len(invalid_rows)}")
+        for inv in invalid_rows:
+            print(f"    ✗ 行 {inv['row_num']} ({inv['project'] or '空'}): {', '.join(inv['errors'])}")
 
 
 def cmd_backup(args):
@@ -251,13 +421,111 @@ def cmd_info(args):
         print(f"配置文件: {entry['config_path']}")
     if entry.get("cert_path"):
         print(f"SSL 证书: {entry['cert_path']}")
-    if entry.get("docker_config_path"):
+    if entry.get("docker") and entry.get("docker_config_path"):
         print(f"Docker 配置: {entry['docker_config_path']}")
+        print(f"使用方式: docker compose -f docker-compose.yml -f {entry['docker_config_path']} up")
 
     if hosts_manager.has_hosts_entry(entry["domain"]):
         print(f"Hosts: ✓ 已配置")
     else:
         print(f"Hosts: ✗ 未配置")
+
+
+def cmd_doctor(args):
+    print("VHost 环境诊断")
+    print("=" * 60)
+
+    results = []
+
+    print("\n[1/5] hosts 文件权限检查")
+    hosts_path = hosts_manager.get_hosts_path()
+    if hosts_path.exists():
+        try:
+            hosts_manager.read_hosts()
+            try:
+                hosts_manager.backup_hosts()
+                results.append(("hosts 读写", "OK", f"可读写 {hosts_path}"))
+            except PermissionError:
+                results.append(("hosts 读写", "WARN", f"可读但不可写 {hosts_path}（需要管理员权限）"))
+            except Exception as e:
+                results.append(("hosts 读写", "WARN", f"可读但写入失败: {e}"))
+        except PermissionError:
+            results.append(("hosts 读写", "FAIL", f"无法读取 {hosts_path}"))
+        except Exception as e:
+            results.append(("hosts 读写", "FAIL", str(e)))
+    else:
+        results.append(("hosts 读写", "FAIL", f"hosts 文件不存在: {hosts_path}"))
+
+    print("\n[2/5] OpenSSL 检查")
+    if ssl_manager.openssl_available():
+        results.append(("OpenSSL", "OK", "已安装可用"))
+    else:
+        results.append(("OpenSSL", "WARN", "未找到（HTTPS 功能不可用）"))
+
+    print("\n[3/5] 代理配置目录检查")
+    configs_dir = registry.get_configs_dir()
+    results.append(("配置目录", "OK", str(configs_dir)))
+
+    certs_dir = registry.get_certs_dir()
+    cert_count = sum(1 for _ in certs_dir.rglob("*.crt")) if certs_dir.exists() else 0
+    results.append(("证书目录", "OK", f"{str(certs_dir)} ({cert_count} 个证书)"))
+
+    docker_dir = registry.get_docker_configs_dir()
+    docker_count = sum(1 for _ in docker_dir.rglob("*.yml")) if docker_dir.exists() else 0
+    results.append(("Docker目录", "OK", f"{str(docker_dir)} ({docker_count} 个配置)"))
+
+    print("\n[4/5] 注册表检查")
+    domains = registry.list_domains()
+    if domains:
+        orphan_count = 0
+        for entry in domains:
+            hosts_ok = hosts_manager.has_hosts_entry(entry["domain"])
+            config_exists = (
+                Path(entry.get("config_path", "")).exists()
+                if entry.get("config_path") else False
+            )
+            if not hosts_ok or not config_exists:
+                orphan_count += 1
+                status = []
+                if not hosts_ok:
+                    status.append("hosts缺失")
+                if not config_exists:
+                    status.append("配置缺失")
+                results.append(("域名状态", "WARN", f"{entry['domain']}: {', '.join(status)}"))
+
+        if orphan_count == 0:
+            results.append(("注册表", "OK", f"{len(domains)} 个域名，状态正常"))
+        else:
+            results.append(("注册表", "WARN", f"{len(domains)} 个域名，{orphan_count} 个异常"))
+    else:
+        results.append(("注册表", "OK", "无域名"))
+
+    print("\n[5/5] 备份目录检查")
+    backup_dir = hosts_manager.get_backup_dir()
+    backups = list(backup_dir.glob("hosts_backup_*")) if backup_dir.exists() else []
+    results.append(("备份", "OK", f"{len(backups)} 个备份"))
+
+    print("\n" + "=" * 60)
+    print("诊断结果汇总")
+    print("=" * 60)
+
+    status_order = {"FAIL": 0, "WARN": 1, "OK": 2}
+    for name, status, detail in sorted(results, key=lambda x: status_order.get(x[1], 99)):
+        icon = {"OK": "✓", "WARN": "⚠", "FAIL": "✗"}.get(status, "?")
+        print(f"  [{icon} {status}] {name}: {detail}")
+
+    fail_count = sum(1 for _, s, _ in results if s == "FAIL")
+    warn_count = sum(1 for _, s, _ in results if s == "WARN")
+    ok_count = sum(1 for _, s, _ in results if s == "OK")
+
+    print(f"\n  OK: {ok_count}  警告: {warn_count}  失败: {fail_count}")
+
+    if fail_count > 0:
+        print("\n请修复以上失败项后再使用 vhost。")
+    elif warn_count > 0:
+        print("\n存在警告项，部分功能可能受限。")
+    else:
+        print("\n环境一切正常，可以正常使用 vhost！")
 
 
 def main():
@@ -268,14 +536,18 @@ def main():
         epilog="""
 示例:
   vhost add myblog 3000                    添加虚拟域名
+  vhost add myblog 3000 --dry-run          预览将要执行的操作
   vhost add myblog 3000 --https            添加并启用 HTTPS
   vhost add myblog 3000 --proxy caddy      使用 Caddy 代理
   vhost add myblog 3000 --https --docker   完整配置
   vhost list                               列出所有虚拟域名
   vhost info myblog                        查看域名详情
   vhost delete myblog                      删除虚拟域名
+  vhost delete myblog --dry-run            预览删除操作
   vhost import projects.csv                批量导入
+  vhost import projects.csv --dry-run      预览批量导入
   vhost backup                             手动备份 hosts
+  vhost doctor                             环境诊断
         """,
     )
 
@@ -296,6 +568,10 @@ def main():
         "--docker", action="store_true",
         help="生成 Docker Compose Override 配置"
     )
+    parser_add.add_argument(
+        "--dry-run", action="store_true",
+        help="预览模式，仅显示将要执行的操作，不实际修改文件"
+    )
     parser_add.set_defaults(func=cmd_add)
 
     parser_list = subparsers.add_parser("list", help="列出所有虚拟域名")
@@ -303,10 +579,18 @@ def main():
 
     parser_delete = subparsers.add_parser("delete", help="删除虚拟域名")
     parser_delete.add_argument("project", help="要删除的项目名称")
+    parser_delete.add_argument(
+        "--dry-run", action="store_true",
+        help="预览模式，仅显示将要删除的内容"
+    )
     parser_delete.set_defaults(func=cmd_delete)
 
     parser_import = subparsers.add_parser("import", help="从 CSV 批量导入")
     parser_import.add_argument("file", help="CSV 文件路径")
+    parser_import.add_argument(
+        "--dry-run", action="store_true",
+        help="预览模式，仅显示将要导入的内容"
+    )
     parser_import.set_defaults(func=cmd_import)
 
     parser_backup = subparsers.add_parser("backup", help="手动备份 hosts 文件")
@@ -315,6 +599,9 @@ def main():
     parser_info = subparsers.add_parser("info", help="查看虚拟域名详情")
     parser_info.add_argument("project", help="项目名称")
     parser_info.set_defaults(func=cmd_info)
+
+    parser_doctor = subparsers.add_parser("doctor", help="环境诊断检查")
+    parser_doctor.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args()
 

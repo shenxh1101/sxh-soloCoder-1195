@@ -134,7 +134,7 @@ def remove_config(domain):
         docker_config_path.unlink()
 
 
-def generate_config(project, port, proxy="nginx", https=False, key_path=None, cert_path=None):
+def generate_config(project, port, proxy="nginx", https=False, key_path=None, cert_path=None, docker=False):
     domain = f"{project}.test"
 
     if proxy == "caddy":
@@ -143,6 +143,62 @@ def generate_config(project, port, proxy="nginx", https=False, key_path=None, ce
         config_path = generate_nginx_config(project, port, domain, https, key_path, cert_path)
 
     docker_config_path = None
-    docker_config_path = generate_docker_compose_override(project, port, domain)
+    if docker:
+        docker_config_path = generate_docker_compose_override(project, port, domain)
 
     return config_path, docker_config_path
+
+
+def preview_config(project, port, proxy="nginx", https=False, docker=False):
+    domain = f"{project}.test"
+    configs_dir = get_configs_dir()
+    result = {
+        "domain": domain,
+        "hosts_entry": f"127.0.0.1 {domain}",
+    }
+
+    if proxy == "caddy":
+        result["config_path"] = str(configs_dir / f"{domain}.Caddyfile")
+    else:
+        result["config_path"] = str(configs_dir / f"{domain}.conf")
+
+    if https:
+        from registry import get_certs_dir
+        certs_dir = get_certs_dir()
+        result["key_path"] = str(certs_dir / domain / f"{domain}.key")
+        result["cert_path"] = str(certs_dir / domain / f"{domain}.crt")
+
+    if docker:
+        docker_dir = get_docker_configs_dir()
+        result["docker_config_path"] = str(docker_dir / f"{domain}.docker-compose.yml")
+
+    return result
+
+
+def preview_delete(project):
+    domain = f"{project}.test"
+    configs_dir = get_configs_dir()
+    result = {
+        "domain": domain,
+        "hosts_entry": f"127.0.0.1 {domain}",
+        "files_to_remove": [],
+    }
+
+    for ext in [".conf", ".Caddyfile"]:
+        config_path = configs_dir / f"{domain}{ext}"
+        if config_path.exists():
+            result["files_to_remove"].append(str(config_path))
+
+    from registry import get_certs_dir, get_docker_configs_dir
+    certs_dir = get_certs_dir()
+    cert_domain_dir = certs_dir / domain
+    if cert_domain_dir.exists():
+        for f in cert_domain_dir.iterdir():
+            result["files_to_remove"].append(str(f))
+
+    docker_dir = get_docker_configs_dir()
+    docker_config = docker_dir / f"{domain}.docker-compose.yml"
+    if docker_config.exists():
+        result["files_to_remove"].append(str(docker_config))
+
+    return result
