@@ -140,3 +140,38 @@ def list_vhost_entries():
         if len(parts) >= 2 and (parts[1].endswith(".test") or parts[1].endswith(".local")):
             entries.append({"ip": parts[0], "domain": parts[1]})
     return entries
+
+
+def check_write_permission():
+    hosts_path = get_hosts_path()
+    if not hosts_path.exists():
+        return False, "hosts 文件不存在"
+
+    try:
+        with open(hosts_path, "r", encoding="utf-8") as f:
+            original = f.read()
+    except PermissionError:
+        return False, "无法读取 hosts 文件"
+    except Exception as e:
+        return False, f"读取 hosts 文件失败: {e}"
+
+    test_marker = f"\n# vhost-test-marker {datetime.now().timestamp()}\n"
+    try:
+        with open(hosts_path, "a", encoding="utf-8") as f:
+            f.write(test_marker)
+    except PermissionError:
+        return False, "没有 hosts 写入权限（需要管理员/sudo）"
+    except Exception as e:
+        return False, f"写入测试失败: {e}"
+
+    try:
+        with open(hosts_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        if test_marker.strip() not in content:
+            return False, "写入验证失败"
+        cleaned = content.replace(test_marker, "")
+        with open(hosts_path, "w", encoding="utf-8") as f:
+            f.write(cleaned)
+        return True, "可读写"
+    except Exception as e:
+        return False, f"写入后清理失败: {e}"

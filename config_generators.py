@@ -1,9 +1,11 @@
 import os
-from registry import get_configs_dir, get_docker_configs_dir
+import subprocess
+import sys
+from registry import get_configs_dir, get_docker_configs_dir, get_certs_dir, get_current_profile
 
 
-def generate_nginx_config(project, port, domain, https=False, key_path=None, cert_path=None):
-    configs_dir = get_configs_dir()
+def generate_nginx_config(project, port, domain, https=False, key_path=None, cert_path=None, profile=None):
+    configs_dir = get_configs_dir(profile)
     config_path = configs_dir / f"{domain}.conf"
 
     lines = []
@@ -56,8 +58,8 @@ def generate_nginx_config(project, port, domain, https=False, key_path=None, cer
     return str(config_path)
 
 
-def generate_caddy_config(project, port, domain, https=False, key_path=None, cert_path=None):
-    configs_dir = get_configs_dir()
+def generate_caddy_config(project, port, domain, https=False, key_path=None, cert_path=None, profile=None):
+    configs_dir = get_configs_dir(profile)
     config_path = configs_dir / f"{domain}.Caddyfile"
 
     lines = []
@@ -82,8 +84,8 @@ def generate_caddy_config(project, port, domain, https=False, key_path=None, cer
     return str(config_path)
 
 
-def generate_docker_compose_override(project, port, domain, container_name=None, service_name=None):
-    docker_dir = get_docker_configs_dir()
+def generate_docker_compose_override(project, port, domain, container_name=None, service_name=None, profile=None):
+    docker_dir = get_docker_configs_dir(profile)
     config_path = docker_dir / f"{domain}.docker-compose.yml"
 
     if container_name is None:
@@ -121,37 +123,37 @@ def generate_docker_compose_override(project, port, domain, container_name=None,
     return str(config_path)
 
 
-def remove_config(domain):
-    configs_dir = get_configs_dir()
+def remove_config(domain, profile=None):
+    configs_dir = get_configs_dir(profile)
     for ext in [".conf", ".Caddyfile"]:
         config_path = configs_dir / f"{domain}{ext}"
         if config_path.exists():
             config_path.unlink()
 
-    docker_dir = get_docker_configs_dir()
+    docker_dir = get_docker_configs_dir(profile)
     docker_config_path = docker_dir / f"{domain}.docker-compose.yml"
     if docker_config_path.exists():
         docker_config_path.unlink()
 
 
-def generate_config(project, port, proxy="nginx", https=False, key_path=None, cert_path=None, docker=False):
+def generate_config(project, port, proxy="nginx", https=False, key_path=None, cert_path=None, docker=False, profile=None):
     domain = f"{project}.test"
 
     if proxy == "caddy":
-        config_path = generate_caddy_config(project, port, domain, https, key_path, cert_path)
+        config_path = generate_caddy_config(project, port, domain, https, key_path, cert_path, profile)
     else:
-        config_path = generate_nginx_config(project, port, domain, https, key_path, cert_path)
+        config_path = generate_nginx_config(project, port, domain, https, key_path, cert_path, profile)
 
     docker_config_path = None
     if docker:
-        docker_config_path = generate_docker_compose_override(project, port, domain)
+        docker_config_path = generate_docker_compose_override(project, port, domain, profile=profile)
 
     return config_path, docker_config_path
 
 
-def preview_config(project, port, proxy="nginx", https=False, docker=False):
+def preview_config(project, port, proxy="nginx", https=False, docker=False, profile=None):
     domain = f"{project}.test"
-    configs_dir = get_configs_dir()
+    configs_dir = get_configs_dir(profile)
     result = {
         "domain": domain,
         "hosts_entry": f"127.0.0.1 {domain}",
@@ -163,21 +165,20 @@ def preview_config(project, port, proxy="nginx", https=False, docker=False):
         result["config_path"] = str(configs_dir / f"{domain}.conf")
 
     if https:
-        from registry import get_certs_dir
-        certs_dir = get_certs_dir()
+        certs_dir = get_certs_dir(profile)
         result["key_path"] = str(certs_dir / domain / f"{domain}.key")
         result["cert_path"] = str(certs_dir / domain / f"{domain}.crt")
 
     if docker:
-        docker_dir = get_docker_configs_dir()
+        docker_dir = get_docker_configs_dir(profile)
         result["docker_config_path"] = str(docker_dir / f"{domain}.docker-compose.yml")
 
     return result
 
 
-def preview_delete(project):
+def preview_delete(project, profile=None):
     domain = f"{project}.test"
-    configs_dir = get_configs_dir()
+    configs_dir = get_configs_dir(profile)
     result = {
         "domain": domain,
         "hosts_entry": f"127.0.0.1 {domain}",
@@ -189,16 +190,61 @@ def preview_delete(project):
         if config_path.exists():
             result["files_to_remove"].append(str(config_path))
 
-    from registry import get_certs_dir, get_docker_configs_dir
-    certs_dir = get_certs_dir()
+    certs_dir = get_certs_dir(profile)
     cert_domain_dir = certs_dir / domain
     if cert_domain_dir.exists():
         for f in cert_domain_dir.iterdir():
             result["files_to_remove"].append(str(f))
 
-    docker_dir = get_docker_configs_dir()
+    docker_dir = get_docker_configs_dir(profile)
     docker_config = docker_dir / f"{domain}.docker-compose.yml"
     if docker_config.exists():
         result["files_to_remove"].append(str(docker_config))
 
     return result
+
+
+def test_nginx_config(config_path):
+    try:
+        result = subprocess.run(
+            ["nginx", "-t", "-c", config_path],
+            capture_output=True, text=True,
+            shell=(sys.platform == "win32"),
+        )
+        if result.returncode == 0:
+            return True, "nginx 配置校验通过", result.stdout
+        else:
+            return False, f"nginx 配置校验失败", result.stderr or result.stdout
+    except FileNotFoundError:
+        return False, "nginx 未安装或不在 PATH 中", ""
+
+
+def test_caddy_config(config_path):
+    try:
+        result = subprocess.run(
+            ["caddy", "validate", "--config", config_path],
+            capture_output=True, text=True,
+            shell=(sys.platform == "win32"),
+        )
+        if result.returncode == 0:
+            return True, "caddy 配置校验通过", result.stdout
+        else:
+            return False, f"caddy 配置校验失败", result.stderr or result.stdout
+    except FileNotFoundError:
+        return False, "caddy 未安装或不在 PATH 中", ""
+
+
+def test_config(config_path, proxy_type):
+    if proxy_type == "caddy":
+        return test_caddy_config(config_path)
+    else:
+        return test_nginx_config(config_path)
+
+
+def get_reload_command(proxy_type):
+    if proxy_type == "caddy":
+        return "caddy reload --config <path>"
+    else:
+        if sys.platform == "win32":
+            return "nginx -s reload"
+        return "sudo nginx -s reload"

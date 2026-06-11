@@ -18,8 +18,8 @@ def openssl_available():
         return False
 
 
-def generate_self_signed_cert(domain):
-    certs_dir = get_certs_dir()
+def generate_self_signed_cert(domain, profile=None):
+    certs_dir = get_certs_dir(profile)
     domain_dir = certs_dir / domain
     domain_dir.mkdir(parents=True, exist_ok=True)
 
@@ -52,8 +52,8 @@ def generate_self_signed_cert(domain):
         return None, None
 
 
-def remove_cert(domain):
-    certs_dir = get_certs_dir()
+def remove_cert(domain, profile=None):
+    certs_dir = get_certs_dir(profile)
     domain_dir = certs_dir / domain
     if domain_dir.exists():
         import shutil
